@@ -11,15 +11,13 @@ from passlib.context import CryptContext
 from jose import JWTError, jwt
 import os
 import json
-<<<<<<< HEAD
 import uvicorn
-=======
->>>>>>> origin/main
 
 # ===== НАСТРОЙКИ =====
 SECRET_KEY = os.getenv("TINTEREST_SECRET_KEY", "dev-secret-key")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
 # ===== БАЗА ДАННЫХ =====
 DATABASE_URL = "sqlite:///./tinterest.db"
@@ -36,8 +34,7 @@ class User(Base):
     city = Column(String, default="")
     interests = Column(String, default="[]")  # JSON array string
     department = Column(String, default="Не указан")
-    created_at = Column(DateTime, default=datetime.utcnow)
-    
+
     messages_sent = relationship("Message", foreign_keys="Message.sender_id", back_populates="sender")
     messages_received = relationship("Message", foreign_keys="Message.receiver_id", back_populates="receiver")
     group_memberships = relationship("GroupMember", back_populates="user")
@@ -61,7 +58,6 @@ class Group(Base):
     city = Column(String, default="")
     interests = Column(String, default="[]")  # JSON array string
     created_by_user_id = Column(Integer, ForeignKey("users.id"))
-    created_at = Column(DateTime, default=datetime.utcnow)
 
     members = relationship("GroupMember", back_populates="group", cascade="all, delete-orphan")
     messages = relationship("GroupMessage", back_populates="group", cascade="all, delete-orphan")
@@ -122,13 +118,6 @@ class UserUpdate(BaseModel):
 class MessageCreate(BaseModel):
     text: str
 
-class MessageResponse(BaseModel):
-    id: int
-    sender_id: int
-    sender_username: str
-    text: str
-    timestamp: str
-
 class GroupCreate(BaseModel):
     name: str
     city: Optional[str] = ""
@@ -157,20 +146,14 @@ app = FastAPI(title="Tinterest API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[FRONTEND_URL],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ===== БЕЗОПАСНОСТЬ =====
-# Используем pbkdf2 для новых паролей (стабильный backend),
-# но разрешаем bcrypt для верификации старых хэшей.
-pwd_context = CryptContext(
-    schemes=["bcrypt", "pbkdf2_sha256"],
-    default="pbkdf2_sha256",
-    deprecated="auto",
-)
+pwd_context = CryptContext(schemes=["pbkdf2_sha256"], default="pbkdf2_sha256")
 security = HTTPBearer()
 
 def verify_password(plain_password, hashed_password):
@@ -250,13 +233,6 @@ def _group_to_response(group: Group, members_count: int) -> dict:
         "interests": _parse_json_list(group.interests),
         "members_count": members_count,
     }
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 # ===== ГОРОДА РФ =====
 RUSSIAN_CITIES = [
@@ -573,11 +549,3 @@ def send_group_message(group_id: int, payload: GroupMessageCreate, db: Session =
 @app.get("/")
 def read_root():
     return {"message": "Tinterest API работает! 🧡"}
-
-if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True
-    )

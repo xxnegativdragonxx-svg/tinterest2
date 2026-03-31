@@ -3,5 +3,5 @@ uvicorn
 SQLAlchemy
 passlib
 python-jose[cryptography]
-httpx
+python-dotenv
 
