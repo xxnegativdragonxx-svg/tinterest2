@@ -4,4 +4,6 @@ SQLAlchemy
 passlib
 python-jose[cryptography]
 python-dotenv
+alembic
+python-multipart
 

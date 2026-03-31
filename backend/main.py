@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
@@ -11,6 +11,8 @@ from passlib.context import CryptContext
 from jose import JWTError, jwt
 import os
 import json
+import uuid
+import shutil
 import uvicorn
 
 # ===== НАСТРОЙКИ =====
@@ -18,6 +20,12 @@ SECRET_KEY = os.getenv("TINTEREST_SECRET_KEY", "dev-secret-key")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
+ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "gif"}
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
+
+# Создать папку для загрузок
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ===== БАЗА ДАННЫХ =====
 DATABASE_URL = "sqlite:///./tinterest.db"
@@ -34,6 +42,7 @@ class User(Base):
     city = Column(String, default="")
     interests = Column(String, default="[]")  # JSON array string
     department = Column(String, default="Не указан")
+    avatar_url = Column(String, default=None, nullable=True)
 
     messages_sent = relationship("Message", foreign_keys="Message.sender_id", back_populates="sender")
     messages_received = relationship("Message", foreign_keys="Message.receiver_id", back_populates="receiver")
@@ -88,6 +97,21 @@ class GroupMessage(Base):
     sender = relationship("User", foreign_keys=[sender_id])
 
 
+# ===== ЛАЙКИ =====
+class Like(Base):
+    __tablename__ = "likes"
+    id = Column(Integer, primary_key=True, index=True)
+    sender_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    receiver_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    is_like = Column(Integer, default=1)  # 1 = лайк, 0 = дизлайк
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (UniqueConstraint("sender_id", "receiver_id", name="uq_like_pair"),)
+
+    sender = relationship("User", foreign_keys=[sender_id], lazy="joined")
+    receiver = relationship("User", foreign_keys=[receiver_id], lazy="joined")
+
+
 # Создать таблицы
 Base.metadata.create_all(bind=engine)
 
@@ -109,6 +133,7 @@ class UserResponse(BaseModel):
     city: str
     interests: List[str]
     department: str
+    avatar_url: Optional[str] = None
 
 class UserUpdate(BaseModel):
     city: Optional[str] = None
@@ -140,6 +165,26 @@ class GroupMessageResponse(BaseModel):
     sender_username: str
     text: str
     timestamp: str
+
+class LikeCreate(BaseModel):
+    is_like: bool = True
+
+class LikeResponse(BaseModel):
+    id: int
+    sender_id: int
+    receiver_id: int
+    is_like: bool
+    created_at: str
+
+class MatchResponse(BaseModel):
+    id: int
+    user_id: int
+    user_username: str
+    user_city: str
+    user_department: str
+    user_interests: List[str]
+    user_avatar_url: Optional[str] = None
+    liked_at: str
 
 # ===== ПРИЛОЖЕНИЕ =====
 app = FastAPI(title="Tinterest API")
@@ -223,6 +268,7 @@ def _user_to_response(user: User) -> dict:
         "city": user.city or "",
         "interests": _parse_json_list(user.interests),
         "department": user.department or "Не указан",
+        "avatar_url": user.avatar_url,
     }
 
 def _group_to_response(group: Group, members_count: int) -> dict:
@@ -325,8 +371,41 @@ def get_user(user_id: int, db: Session = Depends(get_db), current_user: User = D
         raise HTTPException(status_code=404, detail="User not found")
     return _user_to_response(user)
 
+@app.get("/api/users/search")
+def search_users(query: str, limit: int = 20, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Поиск пользователей по username, city, department, interests"""
+    if not query.strip():
+        return []
+    
+    search_term = f"%{query.strip().lower()}%"
+    
+    # Поиск по username
+    users = db.query(User).filter(
+        User.username.ilike(search_term)
+    ).filter(User.id != current_user.id).limit(limit).all()
+    
+    # Если найдено мало, ищем по городу
+    if len(users) < limit:
+        city_users = db.query(User).filter(
+            User.city.ilike(search_term)
+        ).filter(User.id != current_user.id).limit(limit - len(users)).all()
+        for u in city_users:
+            if u not in users:
+                users.append(u)
+    
+    # Если всё ещё мало, ищем по отделу
+    if len(users) < limit:
+        dept_users = db.query(User).filter(
+            User.department.ilike(search_term)
+        ).filter(User.id != current_user.id).limit(limit - len(users)).all()
+        for u in dept_users:
+            if u not in users:
+                users.append(u)
+    
+    return [_user_to_response(u) for u in users[:limit]]
+
 @app.get("/api/matches/{user_id}")
-def get_matches(user_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def get_matches(user_id: int, limit: int = 10, offset: int = 0, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     if current_user.id != user_id:
         raise HTTPException(status_code=403, detail="Forbidden")
     current_user = db.query(User).filter(User.id == user_id).first()
@@ -368,9 +447,20 @@ def get_matches(user_id: int, db: Session = Depends(get_db), current_user: User 
                 "reasons": reasons,
                 "common_interests": common_list,
             })
-    
+
     matches.sort(key=lambda x: x["score"], reverse=True)
-    return matches[:10]  # Топ 10
+    
+    # Пагинация
+    total = len(matches)
+    start = offset
+    end = offset + limit
+    paginated_matches = matches[start:end]
+    
+    return {
+        "matches": paginated_matches,
+        "total": total,
+        "has_more": end < total
+    }
 
 @app.get("/api/chat/{user_id}/{other_id}")
 def get_messages(user_id: int, other_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -545,6 +635,171 @@ def send_group_message(group_id: int, payload: GroupMessageCreate, db: Session =
         "text": msg.text,
         "timestamp": msg.timestamp.isoformat(),
     }
+
+# ===== ЛАЙКИ =====
+@app.post("/api/likes/{user_id}", response_model=LikeResponse)
+def send_like(user_id: int, payload: LikeCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    if current_user.id == user_id:
+        raise HTTPException(status_code=400, detail="Нельзя лайкнуть себя")
+    
+    # Проверка, существует ли пользователь
+    receiver = db.query(User).filter(User.id == user_id).first()
+    if not receiver:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    
+    # Проверка, есть ли уже лайк
+    existing = db.query(Like).filter(
+        Like.sender_id == current_user.id,
+        Like.receiver_id == user_id
+    ).first()
+    
+    if existing:
+        # Обновляем существующий лайк
+        existing.is_like = 1 if payload.is_like else 0
+        db.commit()
+        db.refresh(existing)
+        return {
+            "id": existing.id,
+            "sender_id": existing.sender_id,
+            "receiver_id": existing.receiver_id,
+            "is_like": bool(existing.is_like),
+            "created_at": existing.created_at.isoformat()
+        }
+    
+    # Создаём новый лайк
+    like = Like(
+        sender_id=current_user.id,
+        receiver_id=user_id,
+        is_like=1 if payload.is_like else 0
+    )
+    db.add(like)
+    db.commit()
+    db.refresh(like)
+    
+    return {
+        "id": like.id,
+        "sender_id": like.sender_id,
+        "receiver_id": like.receiver_id,
+        "is_like": bool(like.is_like),
+        "created_at": like.created_at.isoformat()
+    }
+
+@app.get("/api/likes/received", response_model=List[MatchResponse])
+def get_received_likes(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Получить входящие лайки (кто лайкнул меня)"""
+    likes = db.query(Like).filter(
+        Like.receiver_id == current_user.id,
+        Like.is_like == 1
+    ).order_by(Like.created_at.desc()).all()
+    
+    result = []
+    for like in likes:
+        result.append({
+            "id": like.id,
+            "user_id": like.sender_id,
+            "user_username": like.sender.username,
+            "user_city": like.sender.city or "",
+            "user_department": like.sender.department or "Не указан",
+            "user_interests": _parse_json_list(like.sender.interests),
+            "user_avatar_url": None,
+            "liked_at": like.created_at.isoformat()
+        })
+    
+    return result
+
+@app.get("/api/matches", response_model=List[MatchResponse])
+def get_matches_list(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Получить взаимные матчи (когда лайкнули друг друга)"""
+    # Находим всех, кого лайкнул текущий пользователь
+    my_likes = db.query(Like.receiver_id).filter(
+        Like.sender_id == current_user.id,
+        Like.is_like == 1
+    ).subquery()
+    
+    # Находим взаимные лайки
+    matches = db.query(Like).filter(
+        Like.sender_id.in_(my_likes),
+        Like.receiver_id == current_user.id,
+        Like.is_like == 1
+    ).all()
+    
+    result = []
+    for like in matches:
+        liker = like.sender
+        result.append({
+            "id": like.id,
+            "user_id": liker.id,
+            "user_username": liker.username,
+            "user_city": liker.city or "",
+            "user_department": liker.department or "Не указан",
+            "user_interests": _parse_json_list(liker.interests),
+            "user_avatar_url": None,
+            "liked_at": like.created_at.isoformat()
+        })
+    
+    return result
+
+# ===== АВАТАРКИ =====
+def _get_avatar_url(filename: str) -> str:
+    return f"{FRONTEND_URL}/api/avatars/{filename}"
+
+@app.post("/api/me/avatar")
+def upload_avatar(file: UploadFile = File(...), db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Загрузить аватарку пользователя"""
+    # Проверка расширения
+    ext = file.filename.split(".")[-1].lower() if file.filename else ""
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"Разрешены только: {', '.join(ALLOWED_EXTENSIONS)}")
+    
+    # Генерация уникального имени
+    unique_filename = f"{uuid.uuid4()}.{ext}"
+    file_path = os.path.join(UPLOAD_DIR, unique_filename)
+    
+    # Чтение и проверка размера
+    contents = b""
+    while chunk := file.file.read(8192):
+        contents += chunk
+        if len(contents) > MAX_FILE_SIZE:
+            raise HTTPException(status_code=400, detail="Файл слишком большой (макс. 5MB)")
+    
+    # Сохранение
+    with open(file_path, "wb") as f:
+        f.write(contents)
+    
+    # Обновление пользователя
+    avatar_url = _get_avatar_url(unique_filename)
+    current_user.avatar_url = avatar_url
+    db.commit()
+    
+    return {"avatar_url": avatar_url}
+
+@app.get("/api/avatars/{filename}")
+def get_avatar(filename: str):
+    """Получить аватарку по имени файла"""
+    file_path = os.path.join(UPLOAD_DIR, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Аватарка не найдена")
+    
+    from fastapi.responses import FileResponse
+    return FileResponse(file_path, media_type="image/jpeg")
+
+@app.delete("/api/me/avatar")
+def delete_avatar(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Удалить аватарку пользователя"""
+    if current_user.avatar_url:
+        # Извлечь имя файла из URL
+        filename = current_user.avatar_url.split("/")[-1]
+        file_path = os.path.join(UPLOAD_DIR, filename)
+        
+        # Удалить файл
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        
+        # Обновить пользователя
+        current_user.avatar_url = None
+        db.commit()
+    
+    return {"message": "Аватарка удалена"}
 
 @app.get("/")
 def read_root():
