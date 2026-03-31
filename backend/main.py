@@ -11,6 +11,7 @@ from passlib.context import CryptContext
 from jose import JWTError, jwt
 import os
 import json
+import uvicorn
 
 # ===== НАСТРОЙКИ =====
 SECRET_KEY = os.getenv("TINTEREST_SECRET_KEY", "dev-secret-key")
@@ -569,3 +570,10 @@ def send_group_message(group_id: int, payload: GroupMessageCreate, db: Session =
 @app.get("/")
 def read_root():
     return {"message": "Tinterest API работает! 🧡"}
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True
+    )
