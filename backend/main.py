@@ -20,6 +20,7 @@ SECRET_KEY = os.getenv("TINTEREST_SECRET_KEY", "dev-secret-key")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
 ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "gif"}
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
@@ -741,7 +742,7 @@ def get_matches_list(db: Session = Depends(get_db), current_user: User = Depends
 
 # ===== АВАТАРКИ =====
 def _get_avatar_url(filename: str) -> str:
-    return f"{FRONTEND_URL}/api/avatars/{filename}"
+    return f"{BACKEND_URL}/api/avatars/{filename}"
 
 @app.post("/api/me/avatar")
 def upload_avatar(file: UploadFile = File(...), db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
