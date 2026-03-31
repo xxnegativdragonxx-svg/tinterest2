@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+SQLAlchemy
+passlib
+python-jose[cryptography]
+httpx
+
